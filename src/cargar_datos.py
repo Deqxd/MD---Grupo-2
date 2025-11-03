@@ -1,103 +1,120 @@
-import os
 import pandas as pd
+import os
+import csv
+import chardet
 from unidecode import unidecode
 
-# ==========================================================
-# CONFIGURACIÓN DE RUTAS
-# ==========================================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "..", "datos_admision")
-OUTPUT_DIR = os.path.join(BASE_DIR, "..", "data_clean")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ---------- Función auxiliar para detectar y leer CSV correctamente ----------
+def cargar_csv_robusto(ruta_archivo):
+    """Lee un CSV detectando automáticamente encoding y delimitador."""
+    # Detectar codificación probable
+    with open(ruta_archivo, 'rb') as f:
+        enc = chardet.detect(f.read(20000))['encoding']
 
-procesos = ["2023-II", "2024-I", "2024-II", "2025-I", "2025-II", "2026-I"]
-dfs = []
+    # Detectar delimitador probable
+    with open(ruta_archivo, 'r', encoding=enc, errors='ignore') as f:
+        sample = f.read(2000)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+            delim = dialect.delimiter
+        except:
+            delim = ';'  # Por defecto si no se detecta
 
-# ==========================================================
-# FUNCIÓN AUXILIAR PARA NORMALIZAR ENCABEZADOS
-# ==========================================================
-def limpiar_columnas(cols):
-    cols = [unidecode(c).upper().strip().replace(" ", "_") for c in cols]
-    # eliminar duplicaciones tipo "(PRIMERA_OPCION)" mal codificadas
-    cols = [c.replace("(", "").replace(")", "").replace("__", "_") for c in cols]
-    return cols
+    # Leer CSV de forma segura
+    df = pd.read_csv(
+        ruta_archivo,
+        encoding=enc,
+        delimiter=delim,
+        quotechar='"',
+        skip_blank_lines=True,
+        on_bad_lines='skip',
+        engine='python'
+    )
 
-# ==========================================================
-# LECTURA Y LIMPIEZA INICIAL
-# ==========================================================
-for proceso in procesos:
-    print(f"\nCargando archivos del proceso {proceso}...")
-    proceso_path = os.path.join(DATA_DIR, proceso)
+    # Eliminar posibles filas duplicadas del encabezado
+    if df.iloc[0].astype(str).str.contains("CODIGO", case=False).any():
+        df = df[1:]
 
-    for archivo in os.listdir(proceso_path):
-        if archivo.lower().endswith(".csv"):
-            ruta_csv = os.path.join(proceso_path, archivo)
+    return df
 
-            # Lectura segura (intenta latin-1, luego utf-8)
-            try:
-                df = pd.read_csv(ruta_csv, encoding="latin-1")
-            except UnicodeDecodeError:
-                df = pd.read_csv(ruta_csv, encoding="utf-8")
 
-            # Normalizar encabezados
-            df.columns = limpiar_columnas(df.columns)
+# ---------- Función principal ----------
+def cargar_datos():
+    # Ruta raíz del proyecto
+    ruta_actual = os.path.dirname(os.path.abspath(__file__))
+    ruta_raiz = os.path.dirname(ruta_actual)
+    ruta_base = os.path.join(ruta_raiz, "datos_admision")
 
-            df["PROCESO"] = proceso
-            df["ARCHIVO_ORIGEN"] = archivo
+    if not os.path.exists(ruta_base):
+        raise FileNotFoundError(f"No se encontró la carpeta de datos: {ruta_base}")
 
-            # ======================================================
-            # LIMPIEZA ESPECÍFICA PARA 2024-I Y 2024-II
-            # ======================================================
-            if proceso in ["2024-I", "2024-II"]:
-                # Buscar columna OBSERVACION
-                obs_col = next((c for c in df.columns if "OBSERVACION" in c), None)
+    df_total = pd.DataFrame()
 
-                if obs_col:
-                    df[obs_col] = df[obs_col].astype(str)
-                    mask_segunda = df[obs_col].str.contains(
-                        "ALCANZO VACANTE SEGUNDA OPCION", case=False, na=False
-                    )
+    # Función para limpiar nombres de columnas
+    def limpiar_nombre(col):
+        col = unidecode(str(col).strip().upper())
+        col = col.replace("Ó", "O").replace("&OACUTE", "O")
+        col = col.replace("Ã", "O").replace("Ã", "A").replace("Â", "")
+        col = col.replace("(PRIMERA OPCION)", "").strip()
+        return col
 
-                    # 1️⃣ Vaciar OBSERVACION
-                    df.loc[mask_segunda, obs_col] = ""
+    # Recorrer carpetas y archivos CSV
+    for carpeta in os.listdir(ruta_base):
+        ruta_carpeta = os.path.join(ruta_base, carpeta)
+        if os.path.isdir(ruta_carpeta):
+            for archivo in os.listdir(ruta_carpeta):
+                if archivo.endswith(".csv"):
+                    ruta_archivo = os.path.join(ruta_carpeta, archivo)
+                    print(f"📂 Cargando {ruta_archivo}...")
 
-                    # 2️⃣ Vaciar todas las columnas de MERITO relacionadas
-                    for c in df.columns:
-                        if "MERITO" in c:
-                            df.loc[mask_segunda, c] = ""
+                    # Leer archivo de forma robusta
+                    df = cargar_csv_robusto(ruta_archivo)
 
-                    # 3️⃣ Vaciar cualquier columna con SEGUNDA_OPCION
-                    for c in df.columns:
-                        if "SEGUNDA_OPCION" in c:
-                            df.loc[mask_segunda, c] = ""
+                    # Limpieza de nombres de columnas
+                    df.columns = [limpiar_nombre(c) for c in df.columns]
 
-                # 4️⃣ Eliminar columnas de segunda opción (si existen)
-                segunda_cols = [c for c in df.columns if "SEGUNDA_OPCION" in c]
-                if segunda_cols:
-                    df.drop(columns=segunda_cols, inplace=True, errors="ignore")
+                    # Buscar columnas relevantes por similitud
+                    columnas_validas = {
+                        "CODIGO": [c for c in df.columns if "COD" in c],
+                        "APELLIDOS Y NOMBRES": [c for c in df.columns if "APELL" in c],
+                        "ESCUELA PROFESIONAL": [c for c in df.columns if "ESCUELA" in c],
+                        "PUNTAJE": [c for c in df.columns if "PUNTAJE" in c or "PUNTAJ" in c],
+                        "MERITOE.P": [c for c in df.columns if "MERITO" in c],
+                        "OBSERVACION": [c for c in df.columns if "OBSERV" in c],
+                    }
 
-            # Agregar DataFrame procesado
-            dfs.append(df)
+                    # Crear un DataFrame temporal con las columnas correctas
+                    df_temp = pd.DataFrame()
+                    for col_final, posibles in columnas_validas.items():
+                        if posibles:
+                            df_temp[col_final] = df[posibles[0]]
+                        else:
+                            df_temp[col_final] = None  # si no existe, se rellena con nulos
 
-# ==========================================================
-# COMBINAR TODOS LOS DATAFRAMES
-# ==========================================================
-df_all = pd.concat(dfs, ignore_index=True)
+                    # Agregar columna del proceso
+                    df_temp["PROCESO"] = carpeta
 
-# Eliminar duplicados exactos en nombres de columna
-df_all = df_all.loc[:, ~df_all.columns.duplicated(keep="first")]
+                    # Unir al DataFrame total
+                    df_total = pd.concat([df_total, df_temp], ignore_index=True)
 
-print(f"\nTotal de registros combinados: {len(df_all)}")
-print("\nColumnas detectadas:")
-print(list(df_all.columns))
+    # Resultado final
+    print(f"\n✅ Datos cargados y estandarizados: {df_total.shape[0]} registros totales.\n")
+    print(f"Columnas finales: {list(df_total.columns)}")
 
-# ==========================================================
-# GUARDAR DATASET COMBINADO
-# ==========================================================
-output_path = os.path.join(OUTPUT_DIR, "raw_combined.csv")
-df_all.to_csv(output_path, index=False, encoding="utf-8-sig")
+    # Guardar archivo consolidado en carpeta resultados
+    carpeta_resultados = os.path.join(ruta_raiz, "resultados")
+    os.makedirs(carpeta_resultados, exist_ok=True)
+    ruta_salida = os.path.join(carpeta_resultados, "datos_unificados.csv")
 
-print(f"\n✅ Archivo combinado guardado en: {output_path}")
+    df_total.to_csv(ruta_salida, index=False, encoding="utf-8-sig")
+    print(f"💾 Archivo unificado guardado en: {ruta_salida}")
 
-print("\nVista preliminar de datos:")
-print(df_all.head())
+    return df_total
+
+
+# ---------- Ejecución directa ----------
+if __name__ == "__main__":
+    df = cargar_datos()
+    print("\nVista previa:")
+    print(df.head())
